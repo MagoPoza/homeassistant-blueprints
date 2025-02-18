@@ -1,0 +1,185 @@
+blueprint:
+  name: Notificación telegram eventos calendario
+  description: Notifica individualmente cada evento del calendario en telegram y permite posponer los eventos desde botones accionables, con confirmación visual.
+  domain: automation
+  input:
+    calendar_entity:
+      name: Calendario
+      description: Selecciona el calendario a utilizar.
+      selector:
+        entity:
+          domain: calendar
+    telegram_chat_id:
+      name: Chat ID
+      description: Ingresa el chat ID de Telegram al que se enviarán los mensajes.
+      selector:
+        text: {}
+    telegram_thread_id:
+      name: (Opcional) Tema
+      description: El ID del tema de telegram al que queremos enviar el mensaje, dejar en blanco si el chat no tiene temas
+      default: ""
+      selector:
+        text: {}
+
+variables:
+  calendar_entity: !input calendar_entity
+  telegram_chat_id: !input telegram_chat_id
+  telegram_thread_id: !input telegram_thread_id
+  calendar_id: "{{ calendar_entity.split('.')[1] }}"
+  
+triggers:
+  - platform: calendar
+    entity_id: !input calendar_entity
+    event: start
+    offset: "0:0:0"
+    id: calendario
+  - platform: event
+    event_type: telegram_callback
+    id: telegram
+
+conditions: []
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: calendario
+        sequence:
+          - service: calendar.get_events
+            target:
+              entity_id: !input calendar_entity
+            data:
+              start_date_time: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+              duration:
+                hours: 0
+                minutes: 1
+                seconds: 0
+            response_variable: events_response
+          
+          # Verificar si hay eventos antes de continuar
+          - condition: template
+            value_template: "{{ events_response[calendar_entity].events | length > 0 }}"
+          
+          # Enviar un mensaje individual para cada evento
+          - repeat:
+              for_each: "{{ events_response[calendar_entity].events }}"
+              sequence:
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: "{{ telegram_thread_id | string | trim != '' }}"
+                      sequence:
+                        - service: telegram_bot.send_message
+                          data:
+                            message: >
+                              📝 *RECUERDA:*
+                              
+                              - {{ repeat.item.summary }}
+                            target: !input telegram_chat_id
+                            message_thread_id: !input telegram_thread_id
+                            disable_notification: false
+                            inline_keyboard:
+                              - ✅ OK:/ok_{{ repeat.item.summary | replace(' ', '_') }}_{{ calendar_id }}
+                              - ⏰ Posponer:/postpone_{{ repeat.item.summary | replace(' ', '_') }}_{{ calendar_id }}
+                    - conditions: []
+                      sequence:
+                        - service: telegram_bot.send_message
+                          data:
+                            message: >
+                              📝 *RECUERDA:*
+                              
+                              - {{ repeat.item.summary }}
+                            target: !input telegram_chat_id
+                            disable_notification: false
+                            inline_keyboard:
+                              - ✅ OK:/ok_{{ repeat.item.summary | replace(' ', '_') }}_{{ calendar_id }}
+                              - ⏰ Posponer:/postpone_{{ repeat.item.summary | replace(' ', '_') }}_{{ calendar_id }}
+      
+      # Gestión de las respuestas del callback
+      - conditions:
+          - condition: trigger
+            id: telegram
+          - condition: template
+            value_template: "{{ trigger.event.data.data.endswith(calendar_id) }}"
+        sequence:
+          - choose:
+              # Cuando el usuario pulsa OK
+              - conditions:
+                  - condition: template
+                    value_template: "{{ trigger.event.data.data.startswith('/ok_') }}"
+                sequence:
+                  - variables:
+                      event_summary_encoded: "{{ trigger.event.data.data.split('/ok_')[1].rsplit('_' + calendar_id, 1)[0] }}"
+                      event_summary: "{{ event_summary_encoded | replace('_', ' ') }}"
+                      original_message: "{{ trigger.event.data.message.text }}"
+                      updated_message: "{{ original_message | replace('- ' + event_summary, '- ' + event_summary + ' ✅') }}"
+                  - service: telegram_bot.answer_callback_query
+                    data:
+                      callback_query_id: "{{ trigger.event.data.id }}"
+                      message: ✅ Recordatorio confirmado
+                  - service: telegram_bot.edit_message
+                    data:
+                      message_id: "{{ trigger.event.data.message.message_id }}"
+                      chat_id: "{{ trigger.event.data.chat_id }}"
+                      message: "{{ updated_message }}"
+                      inline_keyboard: []
+              
+              # Cuando el usuario pulsa Posponer
+              - conditions:
+                  - condition: template
+                    value_template: "{{ trigger.event.data.data.startswith('/postpone_') and not '/postpone_15m_' in trigger.event.data.data and not '/postpone_30m_' in trigger.event.data.data and not '/postpone_1h_' in trigger.event.data.data and not '/postpone_4h_' in trigger.event.data.data and not '/postpone_8h_' in trigger.event.data.data and not '/postpone_1d_' in trigger.event.data.data }}"
+                sequence:
+                  - variables:
+                      event_summary_encoded: "{{ trigger.event.data.data.split('/postpone_')[1].rsplit('_' + calendar_id, 1)[0] }}"
+                      event_summary: "{{ event_summary_encoded | replace('_', ' ') }}"
+                  - service: telegram_bot.answer_callback_query
+                    data:
+                      callback_query_id: "{{ trigger.event.data.id }}"
+                      message: Selecciona cuánto tiempo quieres posponer
+                  - service: telegram_bot.edit_replymarkup
+                    data:
+                      message_id: "{{ trigger.event.data.message.message_id }}"
+                      chat_id: "{{ trigger.event.data.chat_id }}"
+                      inline_keyboard:
+                        - "15 Min.:/postpone_15m_{{ event_summary_encoded }}_{{ calendar_id }}, 30 Min.:/postpone_30m_{{ event_summary_encoded }}_{{ calendar_id }}, 1 Hora:/postpone_1h_{{ event_summary_encoded }}_{{ calendar_id }}"
+                        - "4 Horas:/postpone_4h_{{ event_summary_encoded }}_{{ calendar_id }}, 8 Horas:/postpone_8h_{{ event_summary_encoded }}_{{ calendar_id }}, 1 Día:/postpone_1d_{{ event_summary_encoded }}_{{ calendar_id }}"
+              
+              # Cuando el usuario selecciona un tiempo para posponer
+              - conditions:
+                  - condition: template
+                    value_template: "{{ trigger.event.data.data.startswith('/postpone_') and ('/postpone_15m_' in trigger.event.data.data or '/postpone_30m_' in trigger.event.data.data or '/postpone_1h_' in trigger.event.data.data or '/postpone_4h_' in trigger.event.data.data or '/postpone_8h_' in trigger.event.data.data or '/postpone_1d_' in trigger.event.data.data) }}"
+                sequence:
+                  - variables:
+                      delay_parts: "{{ trigger.event.data.data.split('_') }}"
+                      delay_key: "{{ delay_parts[1] }}"
+                      delay_readable: "{{ {'15m':'15 Min.', '30m':'30 Min.', '1h':'1 Hora', '4h':'4 Horas', '8h':'8 Horas', '1d':'1 Día'}[delay_key] }}"
+                      delay_minutes: "{{ {'15m':15, '30m':30, '1h':60, '4h':240, '8h':480, '1d':1440}[delay_key] }}"
+                      event_summary_encoded: "{{ trigger.event.data.data.split('_' + delay_key + '_')[1].rsplit('_' + calendar_id, 1)[0] }}"
+                      event_summary: "{{ event_summary_encoded | replace('_', ' ') }}"
+                      original_message: "{{ trigger.event.data.message.text }}"
+                      updated_message: "{{ original_message | replace('- ' + event_summary, '- ' + event_summary + ' ⏰ ' + delay_readable) }}"
+                  - variables:
+                      event_title: >-
+                        {% if '(Pospuesto)' in event_summary %}
+                          {{ event_summary }}
+                        {% else %}
+                          {{ event_summary }} (Pospuesto)
+                        {% endif %}
+                  - service: calendar.create_event
+                    data:
+                      entity_id: !input calendar_entity
+                      summary: "{{ event_title }}"
+                      start_date_time: "{{ (now() + timedelta(minutes=delay_minutes)).strftime('%Y-%m-%d %H:%M:%S') }}"
+                      end_date_time: "{{ (now() + timedelta(minutes=delay_minutes+1)).strftime('%Y-%m-%d %H:%M:%S') }}"
+                  - service: telegram_bot.answer_callback_query
+                    data:
+                      callback_query_id: "{{ trigger.event.data.id }}"
+                      message: ⏰ Recordatorio pospuesto
+                  - service: telegram_bot.edit_message
+                    data:
+                      message_id: "{{ trigger.event.data.message.message_id }}"
+                      chat_id: "{{ trigger.event.data.chat_id }}"
+                      message: "{{ updated_message }}"
+                      inline_keyboard: []
+
+mode: single
