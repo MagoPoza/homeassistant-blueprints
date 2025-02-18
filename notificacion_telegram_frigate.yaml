@@ -1,0 +1,125 @@
+blueprint:
+  name: Frigate - Notificación telegram
+  description: Crea automatizaciones para recibir instantáneas y clips de Frigate en telegram
+  domain: automation
+  input:
+    camera:
+      name: Cámara de Frigate
+      description: El nombre de la cámara tal como se define en la configuración de tu frigate
+        (/config.yml).
+    target_chat:
+      name: Chat ID
+      description: 'El chat_id que utilizará el bot de Telegram. !secret chat_id
+        no está permitido en Blueprint, necesitará el código chat_id. '
+    tema_id:
+      name: Tema
+      description: 'El ID del tema al que queremos enviar el mensaje, dejar en blanco si el chat no tiene temas'
+    notification:
+      name: Notificación
+      description: 'Seleccione "true" para deshabilitar la notificación, deje "false" para
+        recibir notificaciones. '
+      selector:
+        select:
+          options:
+          - 'true'
+          - 'false'
+          custom_value: false
+          multiple: false
+      default: 'false'
+    base_url:
+      name: (Opcional) URL Homeassisstant
+      description: La URL externa de tu instancia de Home Assistant. Esta URL será
+        predeterminada como una URL relativa y abrirá los clips en la aplicación en lugar de en el navegador,
+        lo que puede causar problemas en algunos dispositivos.
+      default: ''
+    zone_filter:
+      name: (Opcional) Filtro de zona
+      description: Sólo notificar si el objeto ha entrado en una zona definida.
+      default: false
+      selector:
+        boolean: {}
+    zones:
+      name: (Opcional) Lista de zonas
+      description: Una lista (-) de zonas sobre las que desea recibir notificaciones.
+      default: []
+      selector:
+        object: {}
+    labels:
+      name: (Opcional) Lista de objetos
+      description: Una lista (-) de objetos sobre los que desea recibir notificaciones.
+      default: []
+      selector:
+        object: {}
+    presence_filter:
+      name: (Opcional) Filtro de presencia
+      description: Sólo notificar si la entidad seleccionada tiene como estado "not_home".
+      default: ''
+      selector:
+        entity:
+          multiple: false
+mode: single
+max_exceeded: silent
+trigger:
+  platform: mqtt
+  topic: frigate/events
+  payload: !input camera
+  value_template: '{{ value_json[''after''][''camera''] }}'
+variables:
+  id: '{{ trigger.payload_json[''after''][''id''] }}'
+  camera: '{{ trigger.payload_json[''after''][''camera''] }}'
+  camera_name: '{{ camera | replace(''_'', '' '') | title }}'
+  target_chat: !input target_chat
+  tema_id: !input tema_id
+  object: '{{ trigger.payload_json[''after''][''label''] }}'
+  label: '{{ object | title }}'
+  entered_zones: '{{ trigger.payload_json[''after''][''entered_zones''] }}'
+  type: '{{ trigger.payload_json[''type''] }}'
+  base_url: !input base_url
+  zone_only: !input zone_filter
+  input_zones: !input zones
+  zones: '{{ input_zones | list }}'
+  input_labels: !input labels
+  labels: '{{ input_labels | list }}'
+  presence_entity: !input presence_filter
+  notification: !input notification
+condition:
+- '{{ type != ''end'' }}'
+- '{{ not zone_only or entered_zones|length > 0 }}'
+- '{{ not zones|length or zones|select(''in'', entered_zones)|list|length > 0 }}'
+- '{{ not labels|length or object in labels }}'
+- '{{ not presence_entity or not is_state(presence_entity, ''home'') }}'
+action: 
+- service: telegram_bot.send_photo
+  data:
+    target: '{{ target_chat }}'
+    message_thread_id: '{{ tema_id }}'
+    disable_notification: '{{ notification }}'
+    caption: |
+      🚨 ALERTA: Detección de {{ label }} por la cámara: {{ camera_name }}
+    url: >-
+      {{base_url}}/api/frigate/notifications/{{id}}/snapshot.jpg
+    
+- repeat:
+    sequence:
+    - wait_for_trigger:
+      - platform: mqtt
+        topic: frigate/events
+        payload: '{{ id }}'
+        value_template: '{{ value_json[''after''][''id''] }}'
+      timeout:
+        minutes: 2
+      continue_on_timeout: false
+    - condition: template
+      value_template: '{{ wait.trigger.payload_json[''type''] == ''end'' }}'
+    - delay:
+        hours: 0
+        minutes: 0
+        seconds: 20
+        milliseconds: 0
+    - service: telegram_bot.send_video
+      data:
+        target: '{{ target_chat }}'
+        message_thread_id: '{{ tema_id }}'
+        disable_notification: '{{ notification }}'
+        url: '{{base_url}}/api/frigate/notifications/{{id}}/{{camera}}/clip.mp4'
+    until: '{{ wait.trigger.payload_json[''type''] == ''end'' }}'
